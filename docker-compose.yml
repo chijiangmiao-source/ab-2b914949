@@ -1,0 +1,75 @@
+# Satellite downlink partition handoff coordinator.
+#
+# Normal run (durable SQLite volume, configurable host port):
+#   docker compose up --build
+#   APP_PORT=9090 APP_HOST=0.0.0.0 docker compose up --build
+#
+# One-shot verification: builds the image, boots a throwaway app instance,
+# runs rule tests (member replacement, invalid confirmations, interruption
+# recovery) and an API smoke, then exits with the verify container's status:
+#   docker compose --profile verify run --build --rm verify
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: partition-handoff:latest
+    environment:
+      PORT: "8080"
+      PARTITION_COUNT: "${PARTITION_COUNT:-32}"
+      HANDOFF_DB: /data/handoff.db
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    ports:
+      # Host bind address and host port are both configurable; the container
+      # always serves on 8080.
+      - "${APP_HOST:-127.0.0.1}:${APP_PORT:-8080}:8080"
+    volumes:
+      - handoff-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3); assert json.load(r)['status']=='ok'"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+    restart: unless-stopped
+
+  # Throwaway coordinator instance used only by the one-shot verify run.
+  # tmpfs gives every verification a pristine, still-durable-across-process
+  # database; the crash-recovery rule tests restart their own processes with
+  # their own temporary database files.
+  verify-app:
+    image: partition-handoff:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["verify"]
+    environment:
+      PORT: "8080"
+      PARTITION_COUNT: "16"
+      HANDOFF_DB: /data/handoff.db
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3); assert json.load(r)['status']=='ok'"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
+    restart: "no"
+
+  verify:
+    image: partition-handoff:latest
+    profiles: ["verify"]
+    depends_on:
+      verify-app:
+        condition: service_healthy
+    environment:
+      APP_URL: "http://verify-app:8080"
+    entrypoint: ["bash", "scripts/verify.sh"]
+    # One-shot container: rule tests -> health wait -> API smoke, then exit
+    # with a status code that becomes the run's result.
+    restart: "no"
+
+volumes:
+  handoff-data:
